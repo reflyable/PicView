@@ -12,6 +12,7 @@ using PicView.Core.Config;
 using PicView.Core.DebugTools;
 using PicView.Core.Extensions;
 using PicView.Core.Localization;
+using PicView.Core.Models;
 using PicView.Core.ViewModels;
 using R3;
 
@@ -38,18 +39,33 @@ public partial class ImageViewer : UserControl, IDisposable
         AddHandler(PinchEvent, TouchMagnifyEvent, RoutingStrategies.Bubble);
         _disposables.Add(new HoverFadeButtonHandler(GalleryShortcut, GalleryShortcut.InnerButton));
 
-        // The video overlay uses a native window that ignores render transforms,
-        // so zoom/pan is locked for the duration of motion photo playback
+        // Zoom/pan is locked for the duration of motion photo playback
         MotionPhotoView.PlaybackStarted += OnMotionPhotoPlaybackStarted;
         MotionPhotoView.PlaybackStopped += OnMotionPhotoPlaybackStopped;
+        SecondaryMotionPhotoView.PlaybackStarted += OnMotionPhotoPlaybackStarted;
+        SecondaryMotionPhotoView.PlaybackStopped += OnMotionPhotoPlaybackStopped;
     }
 
-    private void OnMotionPhotoPlaybackStarted(object? sender, EventArgs e) => ZoomPanControl.IsEnabled = false;
+    private void OnMotionPhotoPlaybackStarted(object? sender, EventArgs e)
+    {
+        ZoomPanControl.IsEnabled = false;
 
-    private void OnMotionPhotoPlaybackStopped(object? sender, EventArgs e) => ZoomPanControl.IsEnabled = true;
+        // Only one clip plays at a time
+        if (ReferenceEquals(sender, MotionPhotoView))
+        {
+            SecondaryMotionPhotoView.Stop();
+        }
+        else
+        {
+            MotionPhotoView.Stop();
+        }
+    }
+
+    private void OnMotionPhotoPlaybackStopped(object? sender, EventArgs e) =>
+        ZoomPanControl.IsEnabled = !MotionPhotoView.IsPlaying && !SecondaryMotionPhotoView.IsPlaying;
 
     /// <summary>
-    /// Notifies the motion photo overlay that a new image is displayed,
+    /// Notifies the motion photo overlays that a new image is displayed,
     /// stopping any running playback and preparing the badge when applicable.
     /// May be called from any thread; UI work is marshalled to the UI thread.
     /// </summary>
@@ -57,22 +73,39 @@ public partial class ImageViewer : UserControl, IDisposable
     {
         if (Dispatcher.UIThread.CheckAccess())
         {
-            MotionPhotoView.OnImageChanged(tabViewModel);
+            UpdateMotionPhotoOverlays(tabViewModel);
         }
         else
         {
-            Dispatcher.UIThread.Post(() => MotionPhotoView.OnImageChanged(tabViewModel));
+            Dispatcher.UIThread.Post(() => UpdateMotionPhotoOverlays(tabViewModel));
         }
     }
 
+    private void UpdateMotionPhotoOverlays(TabViewModel tabViewModel)
+    {
+        var isSingleImage = tabViewModel.SingleImageType is not SingleImageType.None;
+        MotionPhotoView.OnImageChanged(isSingleImage ? null : tabViewModel.Model);
+        SecondaryMotionPhotoView.OnImageChanged(isSingleImage ? null : tabViewModel.SecondaryModel);
+    }
+
     /// <summary>Whether the current image is a playable motion photo.</summary>
-    public bool IsMotionPhotoActive => MotionPhotoView.IsMotionPhotoActive;
+    public bool IsMotionPhotoActive => MotionPhotoView.IsMotionPhotoActive || SecondaryMotionPhotoView.IsMotionPhotoActive;
 
     /// <summary>Stops motion photo playback. Returns true when playback was active.</summary>
-    public bool StopMotionPhotoIfPlaying() => MotionPhotoView.StopIfPlaying();
+    public bool StopMotionPhotoIfPlaying() => MotionPhotoView.StopIfPlaying() | SecondaryMotionPhotoView.StopIfPlaying();
 
     /// <summary>Starts, pauses or resumes motion photo playback.</summary>
-    public void ToggleMotionPhotoPlayPause() => MotionPhotoView.TogglePlayPause();
+    public void ToggleMotionPhotoPlayPause()
+    {
+        if (MotionPhotoView.IsPlaying || !SecondaryMotionPhotoView.IsMotionPhotoActive)
+        {
+            MotionPhotoView.TogglePlayPause();
+        }
+        else
+        {
+            SecondaryMotionPhotoView.TogglePlayPause();
+        }
+    }
 
     public void TriggerScalingModeUpdate(bool invalidate) =>
         ImageControlHelper.TriggerScalingModeUpdate(MainImage, invalidate);
@@ -224,6 +257,9 @@ public partial class ImageViewer : UserControl, IDisposable
         MotionPhotoView.PlaybackStarted -= OnMotionPhotoPlaybackStarted;
         MotionPhotoView.PlaybackStopped -= OnMotionPhotoPlaybackStopped;
         MotionPhotoView.Dispose();
+        SecondaryMotionPhotoView.PlaybackStarted -= OnMotionPhotoPlaybackStarted;
+        SecondaryMotionPhotoView.PlaybackStopped -= OnMotionPhotoPlaybackStopped;
+        SecondaryMotionPhotoView.Dispose();
         _disposables.Dispose();
         HoverBar.Dispose();
     }

@@ -52,6 +52,7 @@ public partial class MotionPhotoView : UserControl, IDisposable
     private StreamMediaInput? _mediaInput;
     private Media? _media;
     private MediaPlayer? _mediaPlayer;
+    private ImageModel? _model;
     private bool _isSessionBusy;
     private bool _isDisposed;
 
@@ -66,6 +67,12 @@ public partial class MotionPhotoView : UserControl, IDisposable
 
     /// <summary>Whether the current image is a playable motion photo (badge or video is shown).</summary>
     public bool IsMotionPhotoActive => IsVisible;
+
+    /// <summary>
+    /// Whether the auto-play setting may trigger playback for this view. Disabled for the
+    /// secondary (side-by-side) view so two clips never start on their own at once.
+    /// </summary>
+    public bool AllowAutoPlay { get; set; } = true;
 
     public MotionPhotoView()
     {
@@ -83,27 +90,21 @@ public partial class MotionPhotoView : UserControl, IDisposable
 
     /// <summary>
     /// Called whenever a new image is displayed. Stops any running playback and prepares
-    /// (or hides) the motion photo overlay for the new model.
+    /// (or hides) the motion photo overlay for the new model. Null hides the overlay.
     /// </summary>
-    public void OnImageChanged(TabViewModel tabViewModel)
+    public void OnImageChanged(ImageModel? model)
     {
         Stop();
+        _model = model;
 
-        var model = tabViewModel.Model;
-        if (tabViewModel.SingleImageType is not SingleImageType.None)
-        {
-            IsVisible = false;
-            return;
-        }
-
-        if (model.ImageType is ImageType.MotionPhoto &&
+        if (model?.ImageType is ImageType.MotionPhoto &&
             model.MotionPhoto is not null &&
             MotionPhotoService.IsPlaybackSupported &&
             MotionPhotoService.TryGetLibVlc(out _))
         {
             IsVisible = true;
             PlayBadge.IsVisible = true;
-            if (Settings.UIProperties.AutoPlayMotionPhotos)
+            if (AllowAutoPlay && Settings.UIProperties.AutoPlayMotionPhotos)
             {
                 _ = PlayAsync();
             }
@@ -159,13 +160,8 @@ public partial class MotionPhotoView : UserControl, IDisposable
             return;
         }
 
-        if (DataContext is not TabViewModel tabViewModel)
-        {
-            return;
-        }
-
-        var model = tabViewModel.Model;
-        if (model.ImageType is not ImageType.MotionPhoto || model.MotionPhoto is null || model.FileInfo is null)
+        var model = _model;
+        if (model?.ImageType is not ImageType.MotionPhoto || model.MotionPhoto is null || model.FileInfo is null)
         {
             return;
         }
@@ -177,11 +173,12 @@ public partial class MotionPhotoView : UserControl, IDisposable
         }
 
         _isSessionBusy = true;
+        var cancellationToken = (DataContext as TabViewModel)?.GetTabCancellation().Token ?? default;
         Stream? stream = null;
         try
         {
             stream = await MotionPhotoExtractor.ExtractAsync(
-                model.FileInfo, model.MotionPhoto, tabViewModel.GetTabCancellation().Token).ConfigureAwait(true);
+                model.FileInfo, model.MotionPhoto, cancellationToken).ConfigureAwait(true);
         }
         catch (Exception e)
         {

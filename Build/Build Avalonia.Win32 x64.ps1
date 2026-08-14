@@ -28,17 +28,18 @@ New-Item -Path $outputPath -ItemType Directory | Out-Null
 # Copy the build output to the final destination
 Copy-Item -Path "$tempPath\*" -Destination $outputPath -Recurse -Force
 
+# Trim libvlc down to what motion photo playback needs (sibling archs, *.lib, lua,
+# hrtfs and unused plugins; ~275 MB -> ~23 MB)
+& (Join-Path -Path $PSScriptRoot -ChildPath "Trim-LibVLCPlugins.ps1") -LibVlcRoot (Join-Path -Path $outputPath -ChildPath "libvlc") -TargetArch "win-x64"
+
 # Remove the license file
 $licensePath = Join-Path -Path $outputPath -ChildPath "Licenses\XamlAnimatedGif LICENSE.txt"
 if (Test-Path $licensePath) {
     Remove-Item -Path $licensePath -Force
 }
 
-# Remove the PDB file
-$pdbPath = Join-Path -Path $outputPath -ChildPath "PicView.Avalonia.pdb"
-if (Test-Path $pdbPath) {
-    Remove-Item -Path $pdbPath -Force
-}
+# Remove debug symbols (native PicView.pdb alone is >150 MB)
+Remove-Item -Path "$outputPath\*.pdb" -Force -ErrorAction SilentlyContinue
 
 #Remove uninstended space
 Rename-Item -path $outputPath -NewName $outputPath.Replace(" ","")

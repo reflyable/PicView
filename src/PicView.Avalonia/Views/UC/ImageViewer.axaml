@@ -41,19 +41,24 @@
                                 HorizontalAlignment="Center"
                                 VerticalAlignment="Center"
                                 LastChildFill="False">
-                                <customControls:PicBox
-                                    x:Name="MainImage"
-                                    CurrentFileInfo="{Binding FileInfo.Value}"
-                                    DockPanel.Dock="Left"
-                                    ImageType="{Binding ImageType.Value}"
-                                    Source="{CompiledBinding Image.Value}" />
-                                <customControls:PicBox
-                                    x:Name="SecondaryImage"
-                                    CurrentFileInfo="{Binding SecondaryFileInfo.Value}"
+                                <Grid DockPanel.Dock="Left">
+                                    <customControls:PicBox
+                                        x:Name="MainImage"
+                                        CurrentFileInfo="{Binding FileInfo.Value}"
+                                        ImageType="{Binding ImageType.Value}"
+                                        Source="{CompiledBinding Image.Value}" />
+                                    <mp:MotionPhotoView x:Name="MotionPhotoView" />
+                                </Grid>
+                                <Grid
                                     DockPanel.Dock="Right"
-                                    ImageType="{Binding SecondaryImageType.Value}"
-                                    IsVisible="{CompiledBinding ParentWindowContext.IsSideBySide.Value}"
-                                    Source="{CompiledBinding SecondaryImage.Value}" />
+                                    IsVisible="{CompiledBinding ParentWindowContext.IsSideBySide.Value}">
+                                    <customControls:PicBox
+                                        x:Name="SecondaryImage"
+                                        CurrentFileInfo="{Binding SecondaryFileInfo.Value}"
+                                        ImageType="{Binding SecondaryImageType.Value}"
+                                        Source="{CompiledBinding SecondaryImage.Value}" />
+                                    <mp:MotionPhotoView x:Name="SecondaryMotionPhotoView" AllowAutoPlay="False" />
+                                </Grid>
                             </DockPanel>
                         </Border>
                     </customControls:AutoScrollViewer>
@@ -82,14 +87,13 @@
                 x:Name="HoverBar"
                 VerticalAlignment="Bottom"
                 ZIndex="2" />
-            <buttons:GalleryShortcut
-                x:Name="GalleryShortcut"
-                HorizontalAlignment="Right"
-                VerticalAlignment="Bottom"
-                IsVisible="{CompiledBinding !ParentWindowContext.IsBottomToolbarShown.Value}"
-                Opacity="0"
-                ZIndex="2" />
-            <mp:MotionPhotoView x:Name="MotionPhotoView" ZIndex="3" />
+        <buttons:GalleryShortcut
+            x:Name="GalleryShortcut"
+            HorizontalAlignment="Right"
+            VerticalAlignment="Bottom"
+            IsVisible="{CompiledBinding !ParentWindowContext.IsBottomToolbarShown.Value}"
+            Opacity="0"
+            ZIndex="2" />
         </Panel>
     </DockPanel>
 </UserControl>
