@@ -7,4 +7,5 @@ public enum ImageType
     AnimatedWebp,
     Bitmap,
     Svg,
+    MotionPhoto,
 }

@@ -1,3 +1,4 @@
+using System.Text;
 using Avalonia.Media.Imaging;
 using Avalonia.Svg.Skia;
 using ImageMagick;
@@ -7,6 +8,7 @@ using PicView.Core.DebugTools;
 using PicView.Core.Exif;
 using PicView.Core.ImageDecoding;
 using PicView.Core.Models;
+using PicView.Core.MotionPhoto;
 using PicView.Core.Navigation.Tiff;
 
 namespace PicView.Avalonia.ImageHandling;
@@ -36,6 +38,14 @@ public static class GetImageModel
 
         try
         {
+            // .livp is a zip container that cannot be pinged by Magick, so it must be
+            // handled before the MagickImage is initialized.
+            if (fileInfo.Extension.Equals(".livp", StringComparison.InvariantCultureIgnoreCase))
+            {
+                await ProcessLivpAsync(fileInfo, imageModel).ConfigureAwait(false);
+                return imageModel;
+            }
+
             // Initialize MagickImage if not provided
             magickImage ??= GetImage.CreateAndPingMagickImage(fileInfo);
 
@@ -139,6 +149,8 @@ public static class GetImageModel
                     break;
             }
 
+            TryDetectMotionPhoto(fileInfo, magickImage, imageModel);
+
             return imageModel;
         }
         catch (Exception e)
@@ -226,6 +238,52 @@ public static class GetImageModel
         }
     }
 
+    /// <summary>
+    /// Checks whether a successfully decoded bitmap is actually a motion photo (XMP embedded
+    /// video, Samsung trailer or sidecar file) and upgrades the model accordingly.
+    /// Only the video location metadata is recorded here; the video bytes are extracted
+    /// on demand when playback starts.
+    /// </summary>
+    private static void TryDetectMotionPhoto(FileInfo fileInfo, MagickImage magickImage, ImageModel imageModel)
+    {
+        if (imageModel.ImageType is not ImageType.Bitmap)
+        {
+            return;
+        }
+
+        var extension = fileInfo.Extension;
+        if (!extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) &&
+            !extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase) &&
+            !extension.Equals(".heic", StringComparison.OrdinalIgnoreCase) &&
+            !extension.Equals(".heif", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        string? xmpPacket = null;
+        try
+        {
+            var xmpProfile = magickImage.GetXmpProfile();
+            if (xmpProfile is not null)
+            {
+                xmpPacket = Encoding.UTF8.GetString(xmpProfile.ToByteArray());
+            }
+        }
+        catch (Exception e)
+        {
+            DebugHelper.LogDebug(nameof(GetImageModel), nameof(TryDetectMotionPhoto), e);
+        }
+
+        var info = MotionPhotoDetector.TryDetect(fileInfo, xmpPacket);
+        if (info is null)
+        {
+            return;
+        }
+
+        imageModel.ImageType = ImageType.MotionPhoto;
+        imageModel.MotionPhoto = info;
+    }
+
     #region Image Processing Methods
 
     private static async ValueTask ProcessSkBitmapAsync(FileInfo fileInfo, MagickFormat format, ImageModel imageModel)
@@ -247,6 +305,39 @@ public static class GetImageModel
     {
         var bitmap = await GetImage.GetBase64ImageAsync(fileInfo).ConfigureAwait(false);
         SetBitmapProperties(bitmap, imageModel);
+    }
+
+    /// <summary>
+    /// Handles Apple .livp containers (a zip holding a still image plus a video).
+    /// The cover image is extracted to a temporary file and decoded through the regular
+    /// pipeline, while the model keeps pointing at the original .livp file.
+    /// </summary>
+    private static async ValueTask ProcessLivpAsync(FileInfo fileInfo, ImageModel imageModel)
+    {
+        var tempImagePath = await MotionPhotoExtractor.ExtractLivpCoverToTempFileAsync(fileInfo).ConfigureAwait(false);
+        if (tempImagePath is null)
+        {
+            imageModel.ImageType = ImageType.Invalid;
+            return;
+        }
+
+        var tempFileInfo = new FileInfo(tempImagePath);
+        using var tempMagickImage = GetImage.CreateAndPingMagickImage(tempFileInfo);
+        if (tempMagickImage.Format is MagickFormat.Jpe or MagickFormat.Jpeg or MagickFormat.Pjpeg)
+        {
+            await ProcessSkBitmapAsync(tempFileInfo, tempMagickImage.Format, imageModel).ConfigureAwait(false);
+        }
+        else
+        {
+            await ProcessNonStandardImageAsync(tempFileInfo, imageModel, tempMagickImage).ConfigureAwait(false);
+        }
+
+        imageModel.FileInfo = fileInfo;
+        if (imageModel.ImageType is ImageType.Bitmap)
+        {
+            imageModel.ImageType = ImageType.MotionPhoto;
+            imageModel.MotionPhoto = new MotionPhotoInfo { Source = MotionPhotoSource.LivpContainer };
+        }
     }
     
     private static async ValueTask ProcessRawImageAsync(FileInfo fileInfo, ImageModel imageModel, MagickImage magickImage)

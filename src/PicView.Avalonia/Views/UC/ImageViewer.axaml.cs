@@ -37,7 +37,42 @@ public partial class ImageViewer : UserControl, IDisposable
         AddHandler(PointerTouchPadGestureMagnifyEvent, TouchMagnifyEvent, RoutingStrategies.Bubble);
         AddHandler(PinchEvent, TouchMagnifyEvent, RoutingStrategies.Bubble);
         _disposables.Add(new HoverFadeButtonHandler(GalleryShortcut, GalleryShortcut.InnerButton));
+
+        // The video overlay uses a native window that ignores render transforms,
+        // so zoom/pan is locked for the duration of motion photo playback
+        MotionPhotoView.PlaybackStarted += OnMotionPhotoPlaybackStarted;
+        MotionPhotoView.PlaybackStopped += OnMotionPhotoPlaybackStopped;
     }
+
+    private void OnMotionPhotoPlaybackStarted(object? sender, EventArgs e) => ZoomPanControl.IsEnabled = false;
+
+    private void OnMotionPhotoPlaybackStopped(object? sender, EventArgs e) => ZoomPanControl.IsEnabled = true;
+
+    /// <summary>
+    /// Notifies the motion photo overlay that a new image is displayed,
+    /// stopping any running playback and preparing the badge when applicable.
+    /// May be called from any thread; UI work is marshalled to the UI thread.
+    /// </summary>
+    public void UpdateMotionPhoto(TabViewModel tabViewModel)
+    {
+        if (Dispatcher.UIThread.CheckAccess())
+        {
+            MotionPhotoView.OnImageChanged(tabViewModel);
+        }
+        else
+        {
+            Dispatcher.UIThread.Post(() => MotionPhotoView.OnImageChanged(tabViewModel));
+        }
+    }
+
+    /// <summary>Whether the current image is a playable motion photo.</summary>
+    public bool IsMotionPhotoActive => MotionPhotoView.IsMotionPhotoActive;
+
+    /// <summary>Stops motion photo playback. Returns true when playback was active.</summary>
+    public bool StopMotionPhotoIfPlaying() => MotionPhotoView.StopIfPlaying();
+
+    /// <summary>Starts, pauses or resumes motion photo playback.</summary>
+    public void ToggleMotionPhotoPlayPause() => MotionPhotoView.TogglePlayPause();
 
     public void TriggerScalingModeUpdate(bool invalidate) =>
         ImageControlHelper.TriggerScalingModeUpdate(MainImage, invalidate);
@@ -186,6 +221,9 @@ public partial class ImageViewer : UserControl, IDisposable
         RemoveHandler(PointerWheelChangedEvent, PreviewOnPointerWheelChanged);
         RemoveHandler(PointerTouchPadGestureMagnifyEvent, TouchMagnifyEvent);
         RemoveHandler(PinchEvent, TouchMagnifyEvent);
+        MotionPhotoView.PlaybackStarted -= OnMotionPhotoPlaybackStarted;
+        MotionPhotoView.PlaybackStopped -= OnMotionPhotoPlaybackStopped;
+        MotionPhotoView.Dispose();
         _disposables.Dispose();
         HoverBar.Dispose();
     }
