@@ -17,6 +17,7 @@ public static class MotionPhotoDetector
 {
     private static readonly byte[] SamsungMarkerBytes = Encoding.ASCII.GetBytes("MotionPhoto_Data");
     private static readonly byte[] JpegXmpHeaderBytes = Encoding.ASCII.GetBytes("http://ns.adobe.com/xap/1.0/");
+    private static readonly byte[] XmpEndTagBytes = Encoding.ASCII.GetBytes("</x:xmpmeta>");
 
     /// <summary>Scan up to 32 MB from the file tail when searching for the Samsung trailer marker.</summary>
     private const int SamsungScanWindowBytes = 32 * 1024 * 1024;
@@ -64,10 +65,16 @@ public static class MotionPhotoDetector
                 }
             }
 
-            var samsung = TryDetectSamsungTrailer(fileInfo);
-            if (samsung is not null)
+            // The Samsung trailer format only exists in JPEG files; scanning the tail of
+            // every HEIC image would just waste I/O.
+            if (extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) ||
+                extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase))
             {
-                return samsung;
+                var samsung = TryDetectSamsungTrailer(fileInfo);
+                if (samsung is not null)
+                {
+                    return samsung;
+                }
             }
 
             return TryDetectSidecar(fileInfo);
@@ -97,13 +104,19 @@ public static class MotionPhotoDetector
 
         if (semanticIndex >= 0)
         {
-            // Search forward first; fall back to a small backward window so reordered
-            // attributes within the same Directory item are still found.
-            var markerIndex = xmp.IndexOf("Item:Length", semanticIndex, StringComparison.OrdinalIgnoreCase);
+            // Only accept an Item:Length that belongs to the same Directory item as the
+            // MotionPhoto semantic. The still-image item carries its own Item:Length,
+            // which must never be mistaken for the video length.
+            var itemEnd = FindItemEnd(xmp, semanticIndex);
+            var markerIndex = xmp.IndexOf("Item:Length", semanticIndex, itemEnd - semanticIndex, StringComparison.OrdinalIgnoreCase);
             if (markerIndex < 0)
             {
-                var backwardStart = Math.Max(0, semanticIndex - 1024);
-                markerIndex = xmp.IndexOf("Item:Length", backwardStart, semanticIndex - backwardStart, StringComparison.OrdinalIgnoreCase);
+                // Attribute-reordered form: Item:Length before Item:Semantic within the same tag.
+                var tagStart = xmp.LastIndexOf('<', semanticIndex);
+                if (tagStart >= 0)
+                {
+                    markerIndex = xmp.IndexOf("Item:Length", tagStart, semanticIndex - tagStart, StringComparison.OrdinalIgnoreCase);
+                }
             }
 
             if (markerIndex >= 0)
@@ -138,6 +151,35 @@ public static class MotionPhotoDetector
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Finds the end of the Directory item containing the given position: the earliest of the
+    /// self-closing tag end (attribute form), the closing item tag (element form) or the start
+    /// of the next sibling item. Returns the packet length when no boundary is found.
+    /// </summary>
+    private static int FindItemEnd(string xmp, int startIndex)
+    {
+        var end = xmp.Length;
+        var selfClose = xmp.IndexOf("/>", startIndex, StringComparison.Ordinal);
+        if (selfClose >= 0)
+        {
+            end = Math.Min(end, selfClose);
+        }
+
+        var elementClose = xmp.IndexOf("</Container:Item>", startIndex, StringComparison.OrdinalIgnoreCase);
+        if (elementClose >= 0)
+        {
+            end = Math.Min(end, elementClose);
+        }
+
+        var nextItem = xmp.IndexOf("<Container:Item", startIndex, StringComparison.OrdinalIgnoreCase);
+        if (nextItem >= 0)
+        {
+            end = Math.Min(end, nextItem);
+        }
+
+        return end;
     }
 
     /// <summary>
@@ -190,6 +232,8 @@ public static class MotionPhotoDetector
 
     /// <summary>
     /// Looks for a same-named sidecar video file (.mov preferred, then .mp4) next to the image.
+    /// The candidate must start with a valid ISO BMFF "ftyp" box, so unrelated same-named
+    /// files are not mistaken for a motion photo video.
     /// </summary>
     internal static MotionPhotoInfo? TryDetectSidecar(FileInfo fileInfo)
     {
@@ -203,7 +247,7 @@ public static class MotionPhotoDetector
         foreach (var extension in new[] { ".mov", ".mp4" })
         {
             var sidecar = new FileInfo(Path.Combine(directory, baseName + extension));
-            if (sidecar.Exists && sidecar.Length > 0)
+            if (sidecar.Exists && sidecar.Length > 0 && HasVideoFileHeader(sidecar))
             {
                 return new MotionPhotoInfo
                 {
@@ -214,6 +258,40 @@ public static class MotionPhotoDetector
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Checks whether the file starts with an ISO BMFF box whose type is "ftyp"
+    /// (4-byte box size followed by the "ftyp" signature).
+    /// </summary>
+    private static bool HasVideoFileHeader(FileInfo file)
+    {
+        Span<byte> header = stackalloc byte[8];
+        try
+        {
+            using var stream = new FileStream(file.FullName, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite, header.Length, FileOptions.SequentialScan);
+            var totalRead = 0;
+            while (totalRead < header.Length)
+            {
+                var read = stream.Read(header.Slice(totalRead));
+                if (read is 0)
+                {
+                    break;
+                }
+
+                totalRead += read;
+            }
+
+            return totalRead == header.Length &&
+                   header[4] == (byte)'f' && header[5] == (byte)'t' &&
+                   header[6] == (byte)'y' && header[7] == (byte)'p';
+        }
+        catch (Exception e)
+        {
+            DebugHelper.LogDebug(nameof(MotionPhotoDetector), nameof(HasVideoFileHeader), e);
+            return false;
+        }
     }
 
     /// <summary>
@@ -247,7 +325,16 @@ public static class MotionPhotoDetector
                 return null;
             }
 
-            return Encoding.UTF8.GetString(span.Slice(headerIndex + packetStart));
+            // Stop at the end of the XMP packet instead of converting the rest of the
+            // scan window (mostly JPEG image data) into a string.
+            var packetSpan = span.Slice(headerIndex + packetStart);
+            var packetEnd = packetSpan.IndexOf(XmpEndTagBytes);
+            if (packetEnd >= 0)
+            {
+                packetSpan = packetSpan.Slice(0, packetEnd + XmpEndTagBytes.Length);
+            }
+
+            return Encoding.UTF8.GetString(packetSpan);
         }
         finally
         {

@@ -168,8 +168,8 @@ public class MotionPhotoDetectorTests : IDisposable
     {
         var imagePath = Path.Combine(_tempDirectory, "IMG_100.heic");
         File.WriteAllBytes(imagePath, [1, 2, 3]);
-        File.WriteAllBytes(Path.Combine(_tempDirectory, "IMG_100.mov"), [1, 2, 3, 4]);
-        File.WriteAllBytes(Path.Combine(_tempDirectory, "IMG_100.mp4"), [5, 6]);
+        File.WriteAllBytes(Path.Combine(_tempDirectory, "IMG_100.mov"), MotionPhotoFixtures.BuildMp4Head(24));
+        File.WriteAllBytes(Path.Combine(_tempDirectory, "IMG_100.mp4"), MotionPhotoFixtures.BuildMp4Head(32));
 
         var result = MotionPhotoDetector.TryDetect(new FileInfo(imagePath), MotionPhotoFixtures.PlainXmp);
 
@@ -183,13 +183,68 @@ public class MotionPhotoDetectorTests : IDisposable
     {
         var imagePath = Path.Combine(_tempDirectory, "IMG_200.jpg");
         File.WriteAllBytes(imagePath, [1, 2, 3]);
-        File.WriteAllBytes(Path.Combine(_tempDirectory, "IMG_200.mp4"), [5, 6]);
+        File.WriteAllBytes(Path.Combine(_tempDirectory, "IMG_200.mp4"), MotionPhotoFixtures.BuildMp4Head(32));
 
         var result = MotionPhotoDetector.TryDetect(new FileInfo(imagePath), MotionPhotoFixtures.PlainXmp);
 
         Assert.NotNull(result);
         Assert.Equal(MotionPhotoSource.Sidecar, result.Source);
         Assert.EndsWith(".mp4", result.SidecarFile?.Name);
+    }
+
+    [Fact]
+    public void TryDetect_SidecarWithoutVideoHeader_ReturnsNull()
+    {
+        // A same-named file that is not a video must not be treated as a motion photo sidecar.
+        var imagePath = Path.Combine(_tempDirectory, "IMG_250.heic");
+        File.WriteAllBytes(imagePath, [1, 2, 3]);
+        File.WriteAllBytes(Path.Combine(_tempDirectory, "IMG_250.mp4"), [5, 6, 7, 8, 9, 10]);
+
+        var result = MotionPhotoDetector.TryDetect(new FileInfo(imagePath), MotionPhotoFixtures.PlainXmp);
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void TryDetect_HeicWithSamsungTrailerMarker_ReturnsNull()
+    {
+        // The Samsung trailer scan only applies to JPEG files.
+        var video = MotionPhotoFixtures.BuildMp4Head(48);
+        var path = Path.Combine(_tempDirectory, "samsung.heic");
+        using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write))
+        {
+            stream.Write(new byte[1024]);
+            stream.Write("MotionPhoto_Data"u8);
+            stream.Write(video);
+        }
+
+        var result = MotionPhotoDetector.TryDetect(new FileInfo(path), MotionPhotoFixtures.PlainXmp);
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void TryDetectFromXmp_MotionItemWithoutLength_IgnoresSiblingLength()
+    {
+        // The still-image item carries its own Item:Length, which must not be used
+        // as the video length when the MotionPhoto item lacks one.
+        const string xmp =
+            """
+            <Container:Directory>
+              <rdf:Seq>
+                <rdf:li rdf:parseType="Resource">
+                  <Container:Item Item:Semantic="Primary" Item:Mime="image/jpeg" Item:Length="3000"/>
+                </rdf:li>
+                <rdf:li rdf:parseType="Resource">
+                  <Container:Item Item:Semantic="MotionPhoto" Item:Mime="video/mp4"/>
+                </rdf:li>
+              </rdf:Seq>
+            </Container:Directory>
+            """;
+
+        var result = MotionPhotoDetector.TryDetectFromXmp(10000, xmp);
+
+        Assert.Null(result);
     }
 
     [Fact]

@@ -62,7 +62,11 @@ public static class MotionPhotoService
                 _libVlc = new LibVLC(
                     "--no-video-title-show",
                     "--no-stats",
-                    "--quiet");
+                    "--quiet",
+                    // Prefer hardware decoding (dxva2/d3d11va/vaapi/videotoolbox); libvlc
+                    // falls back to software decoding automatically when unavailable.
+                    // Frames are still downloaded to CPU memory for the software video callbacks.
+                    "--avcodec-hw=any");
                 libVlc = _libVlc;
                 return true;
             }

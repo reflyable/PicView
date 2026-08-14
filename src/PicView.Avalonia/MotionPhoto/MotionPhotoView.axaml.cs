@@ -27,6 +27,12 @@ public partial class MotionPhotoView : UserControl, IDisposable
 {
     private const int BytesPerPixel = 4;
 
+    /// <summary>Number of display buffers handed to libvlc in rotation (slack for the UI thread).</summary>
+    private const int FrameBufferCount = 3;
+
+    /// <summary>Extra slot decoded into when every display buffer is pending; its frame is dropped.</summary>
+    private const int OverflowBufferIndex = FrameBufferCount;
+
     private static readonly byte[] Rv32Chroma = [(byte)'R', (byte)'V', (byte)'3', (byte)'2'];
 
     private readonly MediaPlayer.LibVLCVideoFormatCb _videoFormatCb;
@@ -36,8 +42,8 @@ public partial class MotionPhotoView : UserControl, IDisposable
     private readonly MediaPlayer.LibVLCVideoDisplayCb _videoDisplayCb;
 
     private readonly Lock _frameLock = new();
-    private IntPtr _frameBuffer;
-    private byte[]? _managedFrame;
+    private IntPtr[] _frameBuffers = [];
+    private int[] _bufferInUse = [];
     private int _frameBufferSize;
     private int _videoWidth;
     private int _videoHeight;
@@ -204,11 +210,11 @@ public partial class MotionPhotoView : UserControl, IDisposable
             _mediaPlayer.EndReached += OnEndReached;
             _mediaPlayer.EncounteredError += OnEncounteredError;
 
-            VideoSurface.IsVisible = true;
+            // The surface stays hidden until the first decoded frame arrives, so the
+            // still image remains untouched while libvlc starts up (no visual pop).
             if (!_mediaPlayer.Play())
             {
                 CleanupSession();
-                VideoSurface.IsVisible = false;
                 _isSessionBusy = false;
                 return;
             }
@@ -221,7 +227,6 @@ public partial class MotionPhotoView : UserControl, IDisposable
         {
             DebugHelper.LogDebug(nameof(MotionPhotoView), nameof(PlayAsync), e);
             CleanupSession();
-            VideoSurface.IsVisible = false;
             IsVisible = false;
         }
         finally
@@ -232,12 +237,16 @@ public partial class MotionPhotoView : UserControl, IDisposable
 
     /// <summary>
     /// Stops playback and releases all playback resources, returning to the cover image.
+    /// The last decoded frame is cleared so it can never flash up when the surface is
+    /// shown again (e.g. when replaying or when the next motion photo has a different
+    /// video resolution).
     /// </summary>
     public void Stop()
     {
         var wasPlaying = IsPlaying;
         CleanupSession();
         VideoSurface.IsVisible = false;
+        VideoSurface.Clear();
         IsPlaying = false;
         if (wasPlaying)
         {
@@ -276,72 +285,123 @@ public partial class MotionPhotoView : UserControl, IDisposable
 
         lock (_frameLock)
         {
-            FreeFrameBufferLocked();
+            FreeFrameBuffersLocked();
             _frameBufferSize = (int)(width * height * BytesPerPixel);
-            _frameBuffer = Marshal.AllocHGlobal(_frameBufferSize);
-            _managedFrame = new byte[_frameBufferSize];
+            _frameBuffers = new IntPtr[FrameBufferCount + 1];
+            _bufferInUse = new int[FrameBufferCount + 1];
+            for (var i = 0; i < _frameBuffers.Length; i++)
+            {
+                _frameBuffers[i] = Marshal.AllocHGlobal(_frameBufferSize);
+            }
+
             _videoWidth = (int)width;
             _videoHeight = (int)height;
         }
 
         Dispatcher.UIThread.Post(() => VideoSurface.EnsureBitmap(_videoWidth, _videoHeight));
-        return 1;
+        return (uint)_frameBuffers.Length;
     }
 
     private void VideoCleanupCallback(ref IntPtr opaque)
     {
         lock (_frameLock)
         {
-            FreeFrameBufferLocked();
+            FreeFrameBuffersLocked();
         }
     }
 
     private IntPtr LockVideoCallback(IntPtr opaque, IntPtr planes)
     {
-        Marshal.WriteIntPtr(planes, _frameBuffer);
-        return IntPtr.Zero;
+        var buffers = _frameBuffers;
+        var inUse = _bufferInUse;
+        if (buffers.Length == 0)
+        {
+            // Format callback has not run (or cleanup already happened); nothing decodable.
+            Marshal.WriteIntPtr(planes, IntPtr.Zero);
+            return (IntPtr)OverflowBufferIndex;
+        }
+
+        for (var i = 0; i < FrameBufferCount; i++)
+        {
+            if (Interlocked.CompareExchange(ref inUse[i], 1, 0) is 0)
+            {
+                // The buffer index is returned as the picture cookie, so the display
+                // callback knows which buffer holds the decoded frame.
+                Marshal.WriteIntPtr(planes, buffers[i]);
+                return (IntPtr)i;
+            }
+        }
+
+        // Every display buffer is waiting for the UI thread: decode into the overflow
+        // buffer instead and let the display callback drop the frame.
+        Marshal.WriteIntPtr(planes, buffers[OverflowBufferIndex]);
+        return (IntPtr)OverflowBufferIndex;
     }
 
     private void UnlockVideoCallback(IntPtr opaque, IntPtr picture, IntPtr planes)
     {
-        // Nothing to unlock; the buffer is reused until the cleanup callback.
+        // Nothing to unlock; buffers are released by the UI thread after the frame is copied.
     }
 
     private void DisplayVideoCallback(IntPtr opaque, IntPtr picture)
     {
-        byte[] frame;
-        int width, height;
-        lock (_frameLock)
+        var index = (int)picture;
+        if (index is OverflowBufferIndex)
         {
-            if (_frameBuffer == IntPtr.Zero || _managedFrame is null)
-            {
-                return;
-            }
+            // Dropped frame; the overflow buffer is never marked in use.
+            return;
+        }
 
-            Marshal.Copy(_frameBuffer, _managedFrame, 0, _frameBufferSize);
-            frame = _managedFrame;
-            width = _videoWidth;
-            height = _videoHeight;
+        var inUse = _bufferInUse;
+        if (index < 0 || index >= inUse.Length)
+        {
+            return;
         }
 
         Dispatcher.UIThread.Post(() =>
         {
+            if (_isDisposed)
+            {
+                Interlocked.Exchange(ref inUse[index], 0);
+                return;
+            }
+
             lock (_frameLock)
             {
-                VideoSurface.UpdateFrame(frame, width, height);
+                try
+                {
+                    if (index < _frameBuffers.Length && _frameBuffers[index] != IntPtr.Zero && _frameBufferSize > 0)
+                    {
+                        // Copy straight from the libvlc buffer into the frame bitmap (single copy).
+                        VideoSurface.UpdateFrame(_frameBuffers[index], _frameBufferSize, _videoWidth, _videoHeight);
+                        // Reveal the surface only now that it holds a current frame
+                        if (!VideoSurface.IsVisible)
+                        {
+                            VideoSurface.IsVisible = true;
+                        }
+                    }
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref inUse[index], 0);
+                }
             }
         });
     }
 
-    private void FreeFrameBufferLocked()
+    private void FreeFrameBuffersLocked()
     {
-        if (_frameBuffer != IntPtr.Zero)
+        foreach (var buffer in _frameBuffers)
         {
-            Marshal.FreeHGlobal(_frameBuffer);
-            _frameBuffer = IntPtr.Zero;
+            if (buffer != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
         }
 
-        _managedFrame = null;
+        _frameBuffers = [];
+        _bufferInUse = [];
+        _frameBufferSize = 0;
     }
 
     #endregion
@@ -367,7 +427,7 @@ public partial class MotionPhotoView : UserControl, IDisposable
 
         lock (_frameLock)
         {
-            FreeFrameBufferLocked();
+            FreeFrameBuffersLocked();
         }
 
         _media?.Dispose();

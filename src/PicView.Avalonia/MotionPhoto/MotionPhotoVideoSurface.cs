@@ -42,39 +42,41 @@ public sealed class MotionPhotoVideoSurface : Control
     }
 
     /// <summary>
-    /// Copies a BGRA32 frame into the bitmap and invalidates the visual. UI thread only.
+    /// Copies a BGRA32 frame from an unmanaged buffer into the bitmap and invalidates
+    /// the visual. UI thread only; the source must stay valid for the duration of the call.
     /// </summary>
-    public void UpdateFrame(byte[] bgra, int width, int height)
+    public unsafe void UpdateFrame(IntPtr bgra, int byteCount, int width, int height)
     {
         try
         {
             EnsureBitmap(width, height);
             var bitmap = _frameBitmap;
-            if (bitmap is null)
+            if (bitmap is null || bgra == IntPtr.Zero)
+            {
+                return;
+            }
+
+            var srcRowBytes = width * 4;
+            if (byteCount < srcRowBytes * height)
             {
                 return;
             }
 
             using var framebuffer = bitmap.Lock();
-            var rowBytes = framebuffer.RowBytes;
-            var srcRowBytes = width * 4;
-            if (rowBytes == srcRowBytes && bgra.Length >= rowBytes * height)
+            var dstRowBytes = framebuffer.RowBytes;
+            var src = (byte*)bgra;
+            var dst = (byte*)framebuffer.Address;
+            if (dstRowBytes == srcRowBytes)
             {
-                System.Runtime.InteropServices.Marshal.Copy(bgra, 0, framebuffer.Address, rowBytes * height);
+                Buffer.MemoryCopy(src, dst, (long)dstRowBytes * height, byteCount);
             }
             else
             {
                 // Copy row by row to handle potential framebuffer padding
                 for (var y = 0; y < height; y++)
                 {
-                    var srcOffset = y * srcRowBytes;
-                    if (srcOffset + srcRowBytes > bgra.Length)
-                    {
-                        break;
-                    }
-
-                    System.Runtime.InteropServices.Marshal.Copy(
-                        bgra, srcOffset, framebuffer.Address + y * rowBytes, srcRowBytes);
+                    Buffer.MemoryCopy(src + (long)y * srcRowBytes, dst + (long)y * dstRowBytes,
+                        dstRowBytes, srcRowBytes);
                 }
             }
 

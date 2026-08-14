@@ -110,11 +110,9 @@ public static class MotionPhotoExtractor
                 return null;
             }
 
-            var memory = new MemoryStream((int)length);
-            stream.Seek(start.Value, SeekOrigin.Begin);
-            await stream.CopyToAsync(memory, ct).ConfigureAwait(false);
-            memory.Position = 0;
-            return memory;
+            // Hand out a live window over the source file instead of copying the whole
+            // video into memory; playback can start immediately and uses no extra RAM.
+            return new FileSliceStream(fileInfo.FullName, start.Value, length);
         }
     }
 
