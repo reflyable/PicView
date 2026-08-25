@@ -38,12 +38,21 @@
                 IsHitTestVisible="False"
                 IsVisible="{CompiledBinding IsMotionPhoto.Value}"
                 Opacity="0.9">
-                <Path
-                    Width="8"
-                    Height="8"
-                    Data="F1M0,0L10,5 0,10z"
-                    Fill="{DynamicResource MainTextColor}"
-                    Stretch="Uniform" />
+                <Grid Width="9" Height="9">
+                    <Path
+                        Width="5.45"
+                        Height="5.45"
+                        Data="{StaticResource LivePhotoRingGeometry}"
+                        Stretch="Uniform"
+                        Stroke="{DynamicResource MainTextColor}"
+                        StrokeThickness="1.7" />
+                    <Path
+                        Data="{StaticResource LivePhotoGlyphGeometry}"
+                        Stretch="Uniform"
+                        Stroke="{DynamicResource MainTextColor}"
+                        StrokeLineCap="Round"
+                        StrokeThickness="2" />
+                </Grid>
             </Border>
         </Grid>
         <ToolTip.Tip>

@@ -1,13 +1,15 @@
-using System.Runtime.InteropServices;
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Interactivity;
+using Avalonia.Media;
 using Avalonia.Threading;
-using LibVLCSharp.Shared;
 using PicView.Core.DebugTools;
 using PicView.Core.ImageDecoding;
 using PicView.Core.Models;
 using PicView.Core.MotionPhoto;
+using PicView.Core.Sizing;
 using PicView.Core.ViewModels;
+using R3;
 
 namespace PicView.Avalonia.MotionPhoto;
 
@@ -17,43 +19,36 @@ namespace PicView.Avalonia.MotionPhoto;
 /// back onto the cover (the badge remains so it can be replayed). Any failure degrades to
 /// showing only the still image.
 /// <para>
-/// Video frames are produced by libvlc software video callbacks (BGRA32) and rendered by
+/// Video frames are produced as BGRA32 buffers by <see cref="MotionPhotoDecoder"/>
+/// (a statically-linked, purpose-built FFmpeg) and rendered by
 /// <see cref="MotionPhotoVideoSurface"/>, which works on every display stack including
-/// Wayland (libvlc 3.x has no public wl_surface embedding API) and lets the video follow
-/// the normal Avalonia compositor.
+/// Wayland and lets the video follow the normal Avalonia compositor. Playback is
+/// video-only by design; motion photos never produce sound.
 /// </para>
 /// </summary>
 public partial class MotionPhotoView : UserControl, IDisposable
 {
-    private const int BytesPerPixel = 4;
+    /// <summary>Inset between the badge and the corner of the image it is anchored to.</summary>
+    private const double BadgeCornerInset = 15;
 
-    /// <summary>Number of display buffers handed to libvlc in rotation (slack for the UI thread).</summary>
-    private const int FrameBufferCount = 3;
+    /// <summary>
+    /// Vertical offset of the badge below its anchor. When the interface is hidden,
+    /// the alternative title bar with the window controls overlays the top of the view,
+    /// so the badge is moved below it; with multiple tabs the tab bar shifts that bar
+    /// down by the tab height.
+    /// </summary>
+    private const double BadgeTopInsetBelowAltBar = 45;
 
-    /// <summary>Extra slot decoded into when every display buffer is pending; its frame is dropped.</summary>
-    private const int OverflowBufferIndex = FrameBufferCount;
-
-    private static readonly byte[] Rv32Chroma = [(byte)'R', (byte)'V', (byte)'3', (byte)'2'];
-
-    private readonly MediaPlayer.LibVLCVideoFormatCb _videoFormatCb;
-    private readonly MediaPlayer.LibVLCVideoCleanupCb _videoCleanupCb;
-    private readonly MediaPlayer.LibVLCVideoLockCb _videoLockCb;
-    private readonly MediaPlayer.LibVLCVideoUnlockCb _videoUnlockCb;
-    private readonly MediaPlayer.LibVLCVideoDisplayCb _videoDisplayCb;
-
-    private readonly Lock _frameLock = new();
-    private IntPtr[] _frameBuffers = [];
-    private int[] _bufferInUse = [];
-    private int _frameBufferSize;
-    private int _videoWidth;
-    private int _videoHeight;
+    private static readonly double BadgeTopInsetBelowAltBarMultiTab = 45 + SizeDefaults.TabHeight;
 
     private Stream? _videoStream;
-    private StreamMediaInput? _mediaInput;
-    private Media? _media;
-    private MediaPlayer? _mediaPlayer;
+    private MotionPhotoDecoder? _decoder;
     private ImageModel? _model;
+    private IDisposable? _uiShownSubscription;
+    private TranslateTransform? _badgeOffset;
+    private double _badgeTopInset = BadgeCornerInset;
     private bool _isSessionBusy;
+    private bool _firstFrameShownInSession;
     private bool _isDisposed;
 
     /// <summary>Raised on the UI thread when video playback starts (zoom/pan should be locked).</summary>
@@ -61,6 +56,12 @@ public partial class MotionPhotoView : UserControl, IDisposable
 
     /// <summary>Raised on the UI thread when video playback stops (zoom/pan can be unlocked).</summary>
     public event EventHandler? PlaybackStopped;
+
+    /// <summary>
+    /// Raised on the UI thread when the first video frame is shown for a playback
+    /// session, so the underlying still image can be hidden while the video covers it.
+    /// </summary>
+    public event EventHandler? FirstFrameShown;
 
     /// <summary>Whether video is currently playing or paused.</summary>
     public bool IsPlaying { get; private set; }
@@ -78,14 +79,54 @@ public partial class MotionPhotoView : UserControl, IDisposable
     {
         InitializeComponent();
         PlayBadge.Click += OnPlayBadgeClicked;
+    }
 
-        // Keep explicit references so the delegates are never garbage-collected while
-        // libvlc may still invoke them (the MediaPlayer also stores them, but be explicit).
-        _videoFormatCb = VideoFormatCallback;
-        _videoCleanupCb = VideoCleanupCallback;
-        _videoLockCb = LockVideoCallback;
-        _videoUnlockCb = UnlockVideoCallback;
-        _videoDisplayCb = DisplayVideoCallback;
+    /// <summary>
+    /// Re-hosts the play badge into a floating overlay panel outside the transformed
+    /// image container, so it stays upright when the image is rotated, flipped or
+    /// zoomed while the hosting view keeps it anchored to the image's on-screen
+    /// top-right corner. The video surface stays behind to cover the image.
+    /// Must be called once by the hosting view before the badge can be shown.
+    /// </summary>
+    public void FloatBadge(Panel overlayHost)
+    {
+        if (ReferenceEquals(PlayBadge.Parent, overlayHost))
+        {
+            return;
+        }
+
+        (PlayBadge.Parent as Panel)?.Children.Remove(PlayBadge);
+        overlayHost.Children.Add(PlayBadge);
+
+        // The badge is placed top-left in the overlay and translated to its anchor,
+        // which the hosting view recomputes via UpdateBadgePosition()
+        _badgeOffset = new TranslateTransform();
+        PlayBadge.RenderTransform = _badgeOffset;
+    }
+
+    /// <summary>
+    /// Anchors the floating badge to the given point, which is the on-screen top-right
+    /// corner of this view expressed in the overlay host's coordinate space. The badge
+    /// is clamped inside the host bounds, so it rests against the panel edges when the
+    /// corner is zoomed or panned out of view. A null corner leaves the previous position.
+    /// </summary>
+    internal void UpdateBadgePosition(Point? visualTopRightCorner, Size hostSize)
+    {
+        if (_badgeOffset is null || visualTopRightCorner is not { } corner)
+        {
+            return;
+        }
+
+        var badgeBounds = PlayBadge.Bounds;
+        var left = corner.X - badgeBounds.Width - BadgeCornerInset;
+        var top = corner.Y + _badgeTopInset;
+
+        // Clamped positions keep the same inset from the panel edges as from the
+        // image corner, so the badge rests 15px inside the panel rather than on it
+        _badgeOffset.X = Math.Clamp(left, BadgeCornerInset,
+            Math.Max(BadgeCornerInset, hostSize.Width - badgeBounds.Width - BadgeCornerInset));
+        _badgeOffset.Y = Math.Clamp(top, _badgeTopInset,
+            Math.Max(_badgeTopInset, hostSize.Height - badgeBounds.Height - BadgeCornerInset));
     }
 
     /// <summary>
@@ -96,11 +137,13 @@ public partial class MotionPhotoView : UserControl, IDisposable
     {
         Stop();
         _model = model;
+        EnsureUiStateSubscription();
+        UpdateBadgeInset();
 
         if (model?.ImageType is ImageType.MotionPhoto &&
             model.MotionPhoto is not null &&
-            MotionPhotoService.IsPlaybackSupported &&
-            MotionPhotoService.TryGetLibVlc(out _))
+            FFmpegService.IsPlaybackSupported &&
+            FFmpegService.TryInitialize())
         {
             IsVisible = true;
             PlayBadge.IsVisible = true;
@@ -111,8 +154,39 @@ public partial class MotionPhotoView : UserControl, IDisposable
         }
         else
         {
+            // The badge no longer hides with the view, so it must be hidden explicitly
             IsVisible = false;
+            PlayBadge.IsVisible = false;
         }
+    }
+
+    /// <summary>
+    /// When the interface is hidden (fullscreen), the alternative title bar with the
+    /// window controls overlays the top of the view and takes pointer input there, so
+    /// the badge is moved below it. With multiple tabs the tab bar shifts that bar
+    /// down by the tab height.
+    /// </summary>
+    private void UpdateBadgeInset()
+    {
+        if (DataContext is not TabViewModel tab || tab.ParentWindowContext.IsUIShown.CurrentValue)
+        {
+            _badgeTopInset = BadgeCornerInset;
+            return;
+        }
+
+        _badgeTopInset = tab.ParentWindowContext.WindowTabs.Tabs.CurrentValue.Count >= 2
+            ? BadgeTopInsetBelowAltBarMultiTab
+            : BadgeTopInsetBelowAltBar;
+    }
+
+    private void EnsureUiStateSubscription()
+    {
+        if (_uiShownSubscription is not null || DataContext is not TabViewModel tab)
+        {
+            return;
+        }
+
+        _uiShownSubscription = tab.ParentWindowContext.IsUIShown.Subscribe(_ => UpdateBadgeInset());
     }
 
     /// <summary>
@@ -121,9 +195,17 @@ public partial class MotionPhotoView : UserControl, IDisposable
     /// </summary>
     public void TogglePlayPause()
     {
-        if (_mediaPlayer is not null && IsPlaying)
+        if (_decoder is not null && IsPlaying)
         {
-            _mediaPlayer.Pause();
+            if (_decoder.IsPaused)
+            {
+                _decoder.Resume();
+            }
+            else
+            {
+                _decoder.Pause();
+            }
+
             return;
         }
 
@@ -150,8 +232,8 @@ public partial class MotionPhotoView : UserControl, IDisposable
     }
 
     /// <summary>
-    /// Starts motion photo playback: extracts the video on demand, hands it to libvlc
-    /// as an in-memory stream and plays it once.
+    /// Starts motion photo playback: extracts the video on demand, decodes it with the
+    /// bundled FFmpeg and presents the frames once.
     /// </summary>
     public async Task PlayAsync()
     {
@@ -166,9 +248,10 @@ public partial class MotionPhotoView : UserControl, IDisposable
             return;
         }
 
-        if (!MotionPhotoService.TryGetLibVlc(out var libVlc))
+        if (!FFmpegService.TryInitialize())
         {
             IsVisible = false;
+            PlayBadge.IsVisible = false;
             return;
         }
 
@@ -190,32 +273,29 @@ public partial class MotionPhotoView : UserControl, IDisposable
             _isSessionBusy = false;
             // Extraction failed: degrade to the still image
             IsVisible = false;
+            PlayBadge.IsVisible = false;
             return;
         }
 
         try
         {
             _videoStream = stream;
-            _mediaInput = new StreamMediaInput(stream);
-            _media = new Media(libVlc, _mediaInput);
-            _mediaPlayer = new MediaPlayer(_media)
-            {
-                Mute = Settings.UIProperties.MuteMotionPhotos,
-            };
-            _mediaPlayer.SetVideoFormatCallbacks(_videoFormatCb, _videoCleanupCb);
-            _mediaPlayer.SetVideoCallbacks(_videoLockCb, _videoUnlockCb, _videoDisplayCb);
-            _mediaPlayer.EndReached += OnEndReached;
-            _mediaPlayer.EncounteredError += OnEncounteredError;
-
-            // The surface stays hidden until the first decoded frame arrives, so the
-            // still image remains untouched while libvlc starts up (no visual pop).
-            if (!_mediaPlayer.Play())
+            _decoder = MotionPhotoDecoder.Create(stream);
+            if (_decoder is null)
             {
                 CleanupSession();
                 _isSessionBusy = false;
                 return;
             }
 
+            _firstFrameShownInSession = false;
+            _decoder.FrameReady += OnFrameReady;
+            _decoder.Ended += OnPlaybackEnded;
+            _decoder.Failed += OnPlaybackEnded;
+            _decoder.Play();
+
+            // The surface stays hidden until the first decoded frame arrives, so the
+            // still image remains untouched while decoding starts up (no visual pop).
             PlayBadge.IsVisible = false;
             IsPlaying = true;
             PlaybackStarted?.Invoke(this, EventArgs.Empty);
@@ -225,6 +305,7 @@ public partial class MotionPhotoView : UserControl, IDisposable
             DebugHelper.LogDebug(nameof(MotionPhotoView), nameof(PlayAsync), e);
             CleanupSession();
             IsVisible = false;
+            PlayBadge.IsVisible = false;
         }
         finally
         {
@@ -253,11 +334,38 @@ public partial class MotionPhotoView : UserControl, IDisposable
 
     private async void OnPlayBadgeClicked(object? sender, RoutedEventArgs e) => await PlayAsync();
 
-    private void OnEndReached(object? sender, EventArgs e) =>
+    private void OnPlaybackEnded(object? sender, EventArgs e) =>
         Dispatcher.UIThread.Post(FreezeBackToCover);
 
-    private void OnEncounteredError(object? sender, EventArgs e) =>
-        Dispatcher.UIThread.Post(FreezeBackToCover);
+    private void OnFrameReady(int index, IntPtr bgra, int byteCount, int width, int height) =>
+        Dispatcher.UIThread.Post(() =>
+        {
+            var decoder = _decoder;
+            if (decoder is null || _isDisposed)
+            {
+                decoder?.ReleaseBuffer(index);
+                return;
+            }
+
+            try
+            {
+                VideoSurface.UpdateFrame(bgra, byteCount, width, height);
+                if (!VideoSurface.IsVisible)
+                {
+                    VideoSurface.IsVisible = true;
+                }
+
+                if (!_firstFrameShownInSession)
+                {
+                    _firstFrameShownInSession = true;
+                    FirstFrameShown?.Invoke(this, EventArgs.Empty);
+                }
+            }
+            finally
+            {
+                decoder.ReleaseBuffer(index);
+            }
+        });
 
     private void FreezeBackToCover()
     {
@@ -271,166 +379,18 @@ public partial class MotionPhotoView : UserControl, IDisposable
         PlayBadge.IsVisible = true;
     }
 
-    #region libvlc software video callbacks
-
-    private uint VideoFormatCallback(ref IntPtr opaque, IntPtr chroma,
-        ref uint width, ref uint height, ref uint pitches, ref uint lines)
-    {
-        Marshal.Copy(Rv32Chroma, 0, chroma, Rv32Chroma.Length);
-        pitches = width * BytesPerPixel;
-        lines = height;
-
-        lock (_frameLock)
-        {
-            FreeFrameBuffersLocked();
-            _frameBufferSize = (int)(width * height * BytesPerPixel);
-            _frameBuffers = new IntPtr[FrameBufferCount + 1];
-            _bufferInUse = new int[FrameBufferCount + 1];
-            for (var i = 0; i < _frameBuffers.Length; i++)
-            {
-                _frameBuffers[i] = Marshal.AllocHGlobal(_frameBufferSize);
-            }
-
-            _videoWidth = (int)width;
-            _videoHeight = (int)height;
-        }
-
-        Dispatcher.UIThread.Post(() => VideoSurface.EnsureBitmap(_videoWidth, _videoHeight));
-        return (uint)_frameBuffers.Length;
-    }
-
-    private void VideoCleanupCallback(ref IntPtr opaque)
-    {
-        lock (_frameLock)
-        {
-            FreeFrameBuffersLocked();
-        }
-    }
-
-    private IntPtr LockVideoCallback(IntPtr opaque, IntPtr planes)
-    {
-        var buffers = _frameBuffers;
-        var inUse = _bufferInUse;
-        if (buffers.Length == 0)
-        {
-            // Format callback has not run (or cleanup already happened); nothing decodable.
-            Marshal.WriteIntPtr(planes, IntPtr.Zero);
-            return (IntPtr)OverflowBufferIndex;
-        }
-
-        for (var i = 0; i < FrameBufferCount; i++)
-        {
-            if (Interlocked.CompareExchange(ref inUse[i], 1, 0) is 0)
-            {
-                // The buffer index is returned as the picture cookie, so the display
-                // callback knows which buffer holds the decoded frame.
-                Marshal.WriteIntPtr(planes, buffers[i]);
-                return (IntPtr)i;
-            }
-        }
-
-        // Every display buffer is waiting for the UI thread: decode into the overflow
-        // buffer instead and let the display callback drop the frame.
-        Marshal.WriteIntPtr(planes, buffers[OverflowBufferIndex]);
-        return (IntPtr)OverflowBufferIndex;
-    }
-
-    private void UnlockVideoCallback(IntPtr opaque, IntPtr picture, IntPtr planes)
-    {
-        // Nothing to unlock; buffers are released by the UI thread after the frame is copied.
-    }
-
-    private void DisplayVideoCallback(IntPtr opaque, IntPtr picture)
-    {
-        var index = (int)picture;
-        if (index is OverflowBufferIndex)
-        {
-            // Dropped frame; the overflow buffer is never marked in use.
-            return;
-        }
-
-        var inUse = _bufferInUse;
-        if (index < 0 || index >= inUse.Length)
-        {
-            return;
-        }
-
-        Dispatcher.UIThread.Post(() =>
-        {
-            if (_isDisposed)
-            {
-                Interlocked.Exchange(ref inUse[index], 0);
-                return;
-            }
-
-            lock (_frameLock)
-            {
-                try
-                {
-                    if (index < _frameBuffers.Length && _frameBuffers[index] != IntPtr.Zero && _frameBufferSize > 0)
-                    {
-                        // Copy straight from the libvlc buffer into the frame bitmap (single copy).
-                        VideoSurface.UpdateFrame(_frameBuffers[index], _frameBufferSize, _videoWidth, _videoHeight);
-                        // Reveal the surface only now that it holds a current frame
-                        if (!VideoSurface.IsVisible)
-                        {
-                            VideoSurface.IsVisible = true;
-                        }
-                    }
-                }
-                finally
-                {
-                    Interlocked.Exchange(ref inUse[index], 0);
-                }
-            }
-        });
-    }
-
-    private void FreeFrameBuffersLocked()
-    {
-        foreach (var buffer in _frameBuffers)
-        {
-            if (buffer != IntPtr.Zero)
-            {
-                Marshal.FreeHGlobal(buffer);
-            }
-        }
-
-        _frameBuffers = [];
-        _bufferInUse = [];
-        _frameBufferSize = 0;
-    }
-
-    #endregion
-
     private void CleanupSession()
     {
-        if (_mediaPlayer is not null)
+        var decoder = _decoder;
+        _decoder = null;
+        if (decoder is not null)
         {
-            _mediaPlayer.EndReached -= OnEndReached;
-            _mediaPlayer.EncounteredError -= OnEncounteredError;
-            try
-            {
-                _mediaPlayer.Stop();
-            }
-            catch (Exception e)
-            {
-                DebugHelper.LogDebug(nameof(MotionPhotoView), nameof(CleanupSession), e);
-            }
-
-            _mediaPlayer.Dispose();
-            _mediaPlayer = null;
+            decoder.FrameReady -= OnFrameReady;
+            decoder.Ended -= OnPlaybackEnded;
+            decoder.Failed -= OnPlaybackEnded;
+            decoder.Dispose();
         }
 
-        lock (_frameLock)
-        {
-            FreeFrameBuffersLocked();
-        }
-
-        _media?.Dispose();
-        _media = null;
-        _mediaInput?.Dispose();
-        _mediaInput = null;
         _videoStream?.Dispose();
         _videoStream = null;
     }
@@ -444,6 +404,8 @@ public partial class MotionPhotoView : UserControl, IDisposable
 
         _isDisposed = true;
         PlayBadge.Click -= OnPlayBadgeClicked;
+        _uiShownSubscription?.Dispose();
+        _uiShownSubscription = null;
         Stop();
         VideoSurface.Clear();
         GC.SuppressFinalize(this);

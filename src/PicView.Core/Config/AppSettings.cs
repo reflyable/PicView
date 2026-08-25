@@ -221,11 +221,6 @@ public class UIProperties
     /// when the image is shown. When false, playback starts via the motion photo badge.
     /// </summary>
     public bool AutoPlayMotionPhotos { get; set; } = false;
-
-    /// <summary>
-    /// Determines whether motion photo playback is muted.
-    /// </summary>
-    public bool MuteMotionPhotos { get; set; } = true;
 }
 
 public class Theme
