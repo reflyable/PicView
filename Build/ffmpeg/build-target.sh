@@ -51,14 +51,26 @@ case $TARGET in
     ;;
   osx-x64)
     CONFIGURE_FLAGS=(--target-os=darwin --arch=x86_64 --enable-cross-compile --enable-pic "--ar=zig ar" "--ranlib=zig ranlib" "--nm=$MACHONM" "--cc=zig cc" "--ld=zig cc --target=x86_64-macos.11.0" "--extra-cflags=--target=x86_64-macos.11.0" --x86asmexe=nasm)
-    LINK_CMD=(zig cc --target=x86_64-macos.11.0 -shared)
-    LINK_EXTRA=(-lm -lpthread -Wl,-s "-Wl,-install_name,@rpath/libpicviewffmpeg.dylib" -Wl,-exported_symbols_list,exports.lst)
+    if [ "$(uname)" = "Darwin" ]; then
+      # Apple hosts link natively (zig cc rejects -exported_symbols_list)
+      LINK_CMD=(cc -arch x86_64 -dynamiclib)
+      LINK_EXTRA=(-lm -lpthread "-Wl,-install_name,@rpath/libpicviewffmpeg.dylib" -Wl,-exported_symbols_list,exports.lst)
+    else
+      LINK_CMD=(zig cc --target=x86_64-macos.11.0 -shared)
+      LINK_EXTRA=(-lm -lpthread -Wl,-s "-Wl,-install_name,@rpath/libpicviewffmpeg.dylib" -Wl,-exported_symbols_list,exports.lst)
+    fi
     OUTLIB=libpicviewffmpeg.dylib
     ;;
   osx-arm64)
     CONFIGURE_FLAGS=(--target-os=darwin --arch=aarch64 --enable-cross-compile --enable-pic "--ar=zig ar" "--ranlib=zig ranlib" "--nm=$MACHONM" --disable-x86asm "--cc=zig cc" "--ld=zig cc --target=aarch64-macos.11.0" "--extra-cflags=--target=aarch64-macos.11.0")
-    LINK_CMD=(zig cc --target=aarch64-macos.11.0 -shared)
-    LINK_EXTRA=(-lm -lpthread -Wl,-s "-Wl,-install_name,@rpath/libpicviewffmpeg.dylib" -Wl,-exported_symbols_list,exports.lst)
+    if [ "$(uname)" = "Darwin" ]; then
+      # Apple hosts link natively (zig cc rejects -exported_symbols_list)
+      LINK_CMD=(cc -arch arm64 -dynamiclib)
+      LINK_EXTRA=(-lm -lpthread "-Wl,-install_name,@rpath/libpicviewffmpeg.dylib" -Wl,-exported_symbols_list,exports.lst)
+    else
+      LINK_CMD=(zig cc --target=aarch64-macos.11.0 -shared)
+      LINK_EXTRA=(-lm -lpthread -Wl,-s "-Wl,-install_name,@rpath/libpicviewffmpeg.dylib" -Wl,-exported_symbols_list,exports.lst)
+    fi
     OUTLIB=libpicviewffmpeg.dylib
     ;;
   *)
