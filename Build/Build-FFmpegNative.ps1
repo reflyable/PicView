@@ -75,8 +75,10 @@ New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
 $sourceDir = Join-Path $workRoot "ffmpeg-$ffmpegVersion"
 
 function ConvertTo-ShellPath([string]$path) {
-    # MSYS2 bash wants /c/... paths; native shells want the path as-is
-    $full = (Resolve-Path $path).Path
+    # MSYS2 bash wants /c/... paths; native shells want the path as-is.
+    # GetFullPath (unlike Resolve-Path) also works for paths that do not exist
+    # yet, e.g. the output directory on a fresh checkout.
+    $full = [System.IO.Path]::GetFullPath($path)
     if (-not $IsWindows) {
         return $full
     }

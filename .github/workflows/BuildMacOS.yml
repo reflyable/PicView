@@ -45,11 +45,17 @@ jobs:
           path: Build/ffmpeg-native/osx-x64
           key: picview-ffmpeg-osx-x64-${{ hashFiles('Build/Build-FFmpegNative.ps1', 'Build/ffmpeg/**', 'Native/ffmpeg/**') }}
 
+      - name: Setup zig
+        if: steps.cache-ffmpeg-osx-arm64.outputs.cache-hit != 'true' || steps.cache-ffmpeg-osx-x64.outputs.cache-hit != 'true'
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.1
+
       - name: Build picview-ffmpeg (macOS)
         if: steps.cache-ffmpeg-osx-arm64.outputs.cache-hit != 'true' || steps.cache-ffmpeg-osx-x64.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          brew install nasm zig make
+          brew install nasm make
 
           # FFmpeg needs GNU make; brew installs it keg-only as gmake, so expose
           # the directory containing it as 'make' to the build script
