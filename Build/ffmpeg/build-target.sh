@@ -96,7 +96,8 @@ _pv_close
 _pv_version
 EOF
 
-"$PV_SRC/configure" \
+# Invoked through sh explicitly: some extraction paths drop the exec bit
+sh "$PV_SRC/configure" \
   --prefix="$PV_ROOT/install-$TARGET" \
   "${CONFIGURE_FLAGS[@]}" \
   --enable-static --disable-shared \
