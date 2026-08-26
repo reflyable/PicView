@@ -56,10 +56,6 @@ New-Item -Path $outputPath -ItemType Directory | Out-Null
 # Copy the build output to the final destination
 Copy-Item -Path "$tempPath\*" -Destination $outputPath -Recurse -Force
 
-# Trim libvlc down to what motion photo playback needs (sibling archs, *.lib, lua,
-# hrtfs and unused plugins; ~275 MB -> ~23 MB)
-& (Join-Path -Path $PSScriptRoot -ChildPath "Trim-LibVLCPlugins.ps1") -LibVlcRoot (Join-Path -Path $outputPath -ChildPath "libvlc") -TargetArch "win-$platform"
-
 # Remove debug symbols (native PicView.pdb alone is >150 MB)
 Remove-Item -Path "$outputPath\*.pdb" -Force -ErrorAction SilentlyContinue
 
